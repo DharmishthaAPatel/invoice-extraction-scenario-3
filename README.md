@@ -1,0 +1,87 @@
+# Invoice Field Extraction — Scenario 3
+
+Extracts 9 required fields from 50 invoice images using two independent
+pipelines, then validates the results against each other.
+
+## Pipelines
+
+| | Pipeline A | Pipeline B |
+|---|---|---|
+| Approach | OCR (Tesseract) + LLM (Claude) | OCR (Tesseract) + regex / rules |
+| Strengths | Robust to OCR noise, template drift, reordered fields | Deterministic, free, no external API, fully auditable |
+| Weaknesses | Costs API calls, can hallucinate | Brittle if the template changes |
+
+Both pipelines start from the same OCR pass (cached to `work/ocr_text/`) so
+the comparison isolates *extraction logic* differences, not OCR differences.
+**This is a real tradeoff, not just a convenience**: if the shared OCR step
+mis-renders or misorders something, both pipelines inherit the same
+distortion, so an A/B "match" in `comparison_report.csv` doesn't validate
+against OCR error — only against the two extraction methods.
+
+## Setup
+
+1. Install system dependency: Tesseract OCR (`apt-get install tesseract-ocr`
+   on Debian/Ubuntu, or `brew install tesseract` on macOS).
+2. `pip install -r requirements.txt`
+3. Download the dataset from Kaggle and point `INVOICE_IMAGES_DIR` at the
+   `batch1-0331` … `batch1-0381` images (50 files):
+   https://www.kaggle.com/datasets/osamahosamabdellatif/high-quality-invoice-images-for-ocr
+4. `export ANTHROPIC_API_KEY=sk-...` (Pipeline A needs this)
+
+## Run
+
+```bash
+export INVOICE_IMAGES_DIR=/path/to/batch1_1
+python main.py
+```
+
+## Outputs
+
+- **output.csv** — one row per image, the reconciled/final field values.
+  Reconciliation rule (see `reconcile.py`): if both pipelines agree, use
+  that value; if they disagree, Pipeline A (LLM) wins unless it's empty, in
+  which case Pipeline B fills the gap. Change `PRIMARY_PIPELINE` in
+  `config.py` to flip this.
+- **comparison_report.csv** — one row per (image, field): both pipelines'
+  raw values and a boolean `match` column. Numeric fields (net/VAT/gross
+  worth) are compared with a small tolerance to absorb rounding noise;
+  everything else is compared as normalized text.
+- **work/ocr_text/*.txt** — cached raw OCR text per image.
+- **work/ocr_words/*.json** — cached word-level OCR bounding boxes per
+  image (`{text, left, top, width, height, block_num, par_num, line_num}`),
+  used by Pipeline B to split the Seller/Client columns positionally.
+- **work/results/*.json** — raw per-pipeline output per image, for
+  debugging disagreements.
+
+## Notes / assumptions
+
+- Pipeline B's regex patterns assume the dataset's known template layout
+  (`Seller:` / `Client:` blocks, `Tax Id:`, `Invoice no:`, `Date of issue:`,
+  a `SUMMARY` block with a `Total` row of net/VAT/gross). If your batch uses
+  a different template, adjust the patterns in `pipeline_b_rules.py`.
+- The dataset renders Seller and Client info in two side-by-side columns,
+  which Tesseract's plain-text output collapses onto shared lines (e.g.
+  `Seller: Client:` and `Chavez Ltd Roberts Ltd` on one line each). Regex
+  alone can't reliably split that back into two names, so
+  `extract_fields_rules(ocr_text, words)` also takes word bounding-box data
+  (`ocr_utils.ocr_words()`) and splits each line at the seller/client column
+  boundary using word x-positions. Without `words`, it falls back to a
+  same-line text heuristic that can't recover the seller/client split.
+- Monetary values in this dataset use a comma decimal separator and a space
+  thousands separator (e.g. `1 612,50`), and the SUMMARY block's individual
+  `Net worth` / `VAT` / `Gross worth` labels sit on a different line than
+  their values — only the `Total` row has label and numbers adjacent.
+  `pipeline_b_rules.py` reads all three totals from that `Total` row
+  (`TOTAL_LINE_RE`) and normalizes both comma- and period-decimal formats
+  via `_clean_number`; label-adjacent regexes remain as a fallback for other
+  templates. Output values are plain numeric strings (`.` decimal, no
+  thousands separator, no currency symbol) regardless of the source format.
+- `main.py` is resilient to a single bad image/API hiccup — Pipeline A
+  retries a couple of times, then falls back to empty values rather than
+  crashing the whole batch. If `ANTHROPIC_API_KEY` is unset, invalid, or out
+  of credit, Pipeline A will fall back to empty values for *every* image —
+  `output.csv` will then be effectively Pipeline B's output alone, and the
+  agreement percentage in `comparison_report.csv` becomes meaningless (it's
+  measuring "how often B matches an empty value," not real pipeline
+  agreement). Check the run's stderr output for `[pipeline_a] giving up`
+  lines before trusting that percentage.
